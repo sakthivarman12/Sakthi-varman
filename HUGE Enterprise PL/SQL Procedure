@@ -1,0 +1,160 @@
+This simulates:
+Insurance policy processing
+Risk scoring preparation for AI model
+Data cleaning
+Feature aggregation
+Audit logging
+Batch processing
+
+CREATE OR REPLACE PROCEDURE process_insurance_ai_pipeline (
+    p_batch_date DATE
+)
+IS
+
+    -- Cursor to fetch active policies
+    CURSOR policy_cursor IS
+        SELECT 
+            policy_id,
+            customer_id,
+            premium_amount,
+            claim_count,
+            last_claim_date,
+            policy_status
+        FROM insurance_policies
+        WHERE policy_status = 'ACTIVE';
+
+    -- Variables
+    v_risk_score NUMBER := 0;
+    v_days_since_claim NUMBER;
+    v_error_message VARCHAR2(4000);
+
+    -- Logging procedure (internal)
+    PROCEDURE log_event(
+        p_policy_id NUMBER,
+        p_status VARCHAR2,
+        p_message VARCHAR2
+    )
+    IS
+    BEGIN
+        INSERT INTO pipeline_audit_log(
+            policy_id,
+            log_date,
+            status,
+            message
+        )
+        VALUES (
+            p_policy_id,
+            SYSDATE,
+            p_status,
+            p_message
+        );
+    END;
+
+BEGIN
+
+    DBMS_OUTPUT.PUT_LINE('Pipeline Started for Batch Date: ' || p_batch_date);
+
+    -- Step 1: Clean old temporary data
+    DELETE FROM ai_training_dataset_temp
+    WHERE created_date < p_batch_date - 30;
+
+    COMMIT;
+
+    -- Step 2: Process policies
+    FOR rec IN policy_cursor LOOP
+
+        BEGIN
+
+            -- Calculate days since last claim
+            IF rec.last_claim_date IS NOT NULL THEN
+                v_days_since_claim := p_batch_date - rec.last_claim_date;
+            ELSE
+                v_days_since_claim := 9999;
+            END IF;
+
+            -- Basic risk scoring logic (AI feature engineering)
+            v_risk_score := 0;
+
+            IF rec.claim_count > 5 THEN
+                v_risk_score := v_risk_score + 50;
+            END IF;
+
+            IF rec.premium_amount < 5000 THEN
+                v_risk_score := v_risk_score + 20;
+            END IF;
+
+            IF v_days_since_claim < 30 THEN
+                v_risk_score := v_risk_score + 30;
+            END IF;
+
+            -- Insert into AI training dataset
+            INSERT INTO ai_training_dataset_temp(
+                policy_id,
+                customer_id,
+                premium_amount,
+                claim_count,
+                days_since_last_claim,
+                risk_score,
+                created_date
+            )
+            VALUES (
+                rec.policy_id,
+                rec.customer_id,
+                rec.premium_amount,
+                rec.claim_count,
+                v_days_since_claim,
+                v_risk_score,
+                SYSDATE
+            );
+
+            -- Log success
+            log_event(rec.policy_id, 'SUCCESS', 'Policy processed successfully');
+
+        EXCEPTION
+            WHEN OTHERS THEN
+
+                v_error_message := SQLERRM;
+
+                -- Log error
+                log_event(rec.policy_id, 'ERROR', v_error_message);
+
+        END;
+
+    END LOOP;
+
+    COMMIT;
+
+    -- Step 3: Aggregate features for AI model
+    INSERT INTO ai_training_dataset_final(
+        customer_id,
+        total_policies,
+        avg_risk_score,
+        total_claims
+    )
+    SELECT
+        customer_id,
+        COUNT(policy_id),
+        AVG(risk_score),
+        SUM(claim_count)
+    FROM ai_training_dataset_temp
+    GROUP BY customer_id;
+
+    COMMIT;
+
+    -- Step 4: DBA-style maintenance (automation)
+    BEGIN
+        EXECUTE IMMEDIATE 'ALTER INDEX IDX_AI_TRAINING REBUILD';
+    EXCEPTION
+        WHEN OTHERS THEN
+            DBMS_OUTPUT.PUT_LINE('Index rebuild skipped.');
+    END;
+
+    DBMS_OUTPUT.PUT_LINE('Pipeline Completed Successfully');
+
+EXCEPTION
+    WHEN OTHERS THEN
+        DBMS_OUTPUT.PUT_LINE('Pipeline Failed: ' || SQLERRM);
+        ROLLBACK;
+
+END;
+/
