@@ -6,89 +6,131 @@ Feature aggregation
 Audit logging
 Batch processing
 
-CREATE OR REPLACE PROCEDURE process_insurance_ai_pipeline (
+CREATE OR REPLACE PROCEDURE elite_insurance_ai_pipeline (
     p_batch_date DATE
 )
 IS
 
-    -- Cursor to fetch active policies
-    CURSOR policy_cursor IS
-        SELECT 
-            policy_id,
-            customer_id,
-            premium_amount,
-            claim_count,
-            last_claim_date,
-            policy_status
+    -------------------------------------------------------------------
+    -- TYPES FOR BULK PROCESSING (HIGH PERFORMANCE)
+    -------------------------------------------------------------------
+    TYPE t_policy IS RECORD (
+        policy_id          NUMBER,
+        customer_id        NUMBER,
+        premium_amount     NUMBER,
+        claim_count        NUMBER,
+        last_claim_date    DATE
+    );
+
+    TYPE t_policy_table IS TABLE OF t_policy INDEX BY PLS_INTEGER;
+
+    v_policies        t_policy_table;
+
+    -------------------------------------------------------------------
+    -- VARIABLES
+    -------------------------------------------------------------------
+    v_limit CONSTANT NUMBER := 500;
+    v_days_since_claim NUMBER;
+    v_risk_score NUMBER;
+
+    -------------------------------------------------------------------
+    -- CURSOR
+    -------------------------------------------------------------------
+    CURSOR c_policy IS
+        SELECT policy_id,
+               customer_id,
+               premium_amount,
+               claim_count,
+               last_claim_date
         FROM insurance_policies
         WHERE policy_status = 'ACTIVE';
 
-    -- Variables
-    v_risk_score NUMBER := 0;
-    v_days_since_claim NUMBER;
-    v_error_message VARCHAR2(4000);
-
-    -- Logging procedure (internal)
+    -------------------------------------------------------------------
+    -- LOGGING FRAMEWORK
+    -------------------------------------------------------------------
     PROCEDURE log_event(
-        p_policy_id NUMBER,
+        p_entity_id NUMBER,
         p_status VARCHAR2,
         p_message VARCHAR2
-    )
-    IS
+    ) IS
     BEGIN
         INSERT INTO pipeline_audit_log(
-            policy_id,
-            log_date,
+            entity_id,
+            log_time,
             status,
             message
         )
-        VALUES (
-            p_policy_id,
+        VALUES(
+            p_entity_id,
             SYSDATE,
             p_status,
-            p_message
+            SUBSTR(p_message,1,4000)
         );
+    EXCEPTION
+        WHEN OTHERS THEN
+            NULL; -- logging should never break pipeline
+    END;
+
+    -------------------------------------------------------------------
+    -- DATA CLEANUP STEP
+    -------------------------------------------------------------------
+    PROCEDURE cleanup_stage IS
+    BEGIN
+        DELETE FROM ai_training_dataset_temp
+        WHERE created_date < p_batch_date - 60;
+        COMMIT;
+    END;
+
+    -------------------------------------------------------------------
+    -- RISK SCORE CALCULATION (AI FEATURE ENGINEERING)
+    -------------------------------------------------------------------
+    FUNCTION calculate_risk(
+        p_claim_count NUMBER,
+        p_premium NUMBER,
+        p_days_since_claim NUMBER
+    ) RETURN NUMBER
+    IS
+        v_score NUMBER := 0;
+    BEGIN
+
+        IF p_claim_count > 5 THEN
+            v_score := v_score + 50;
+        END IF;
+
+        IF p_premium < 5000 THEN
+            v_score := v_score + 20;
+        END IF;
+
+        IF p_days_since_claim < 30 THEN
+            v_score := v_score + 30;
+        END IF;
+
+        RETURN v_score;
     END;
 
 BEGIN
 
-    DBMS_OUTPUT.PUT_LINE('Pipeline Started for Batch Date: ' || p_batch_date);
+    DBMS_OUTPUT.PUT_LINE('Elite AI Pipeline Started');
 
-    -- Step 1: Clean old temporary data
-    DELETE FROM ai_training_dataset_temp
-    WHERE created_date < p_batch_date - 30;
+    -------------------------------------------------------------------
+    -- STEP 1 CLEANUP
+    -------------------------------------------------------------------
+    cleanup_stage;
 
-    COMMIT;
+    -------------------------------------------------------------------
+    -- STEP 2 BULK PROCESSING LOOP
+    -------------------------------------------------------------------
+    OPEN c_policy;
 
-    -- Step 2: Process policies
-    FOR rec IN policy_cursor LOOP
+    LOOP
 
-        BEGIN
+        FETCH c_policy BULK COLLECT INTO v_policies LIMIT v_limit;
 
-            -- Calculate days since last claim
-            IF rec.last_claim_date IS NOT NULL THEN
-                v_days_since_claim := p_batch_date - rec.last_claim_date;
-            ELSE
-                v_days_since_claim := 9999;
-            END IF;
+        EXIT WHEN v_policies.COUNT = 0;
 
-            -- Basic risk scoring logic (AI feature engineering)
-            v_risk_score := 0;
+        FORALL i IN 1 .. v_policies.COUNT SAVE EXCEPTIONS
 
-            IF rec.claim_count > 5 THEN
-                v_risk_score := v_risk_score + 50;
-            END IF;
-
-            IF rec.premium_amount < 5000 THEN
-                v_risk_score := v_risk_score + 20;
-            END IF;
-
-            IF v_days_since_claim < 30 THEN
-                v_risk_score := v_risk_score + 30;
-            END IF;
-
-            -- Insert into AI training dataset
-            INSERT INTO ai_training_dataset_temp(
+            INSERT INTO ai_training_dataset_temp (
                 policy_id,
                 customer_id,
                 premium_amount,
@@ -98,33 +140,43 @@ BEGIN
                 created_date
             )
             VALUES (
-                rec.policy_id,
-                rec.customer_id,
-                rec.premium_amount,
-                rec.claim_count,
-                v_days_since_claim,
-                v_risk_score,
+
+                v_policies(i).policy_id,
+
+                v_policies(i).customer_id,
+
+                v_policies(i).premium_amount,
+
+                v_policies(i).claim_count,
+
+                CASE
+                    WHEN v_policies(i).last_claim_date IS NULL
+                    THEN 9999
+                    ELSE p_batch_date - v_policies(i).last_claim_date
+                END,
+
+                calculate_risk(
+                    v_policies(i).claim_count,
+                    v_policies(i).premium_amount,
+                    CASE
+                        WHEN v_policies(i).last_claim_date IS NULL
+                        THEN 9999
+                        ELSE p_batch_date - v_policies(i).last_claim_date
+                    END
+                ),
+
                 SYSDATE
             );
 
-            -- Log success
-            log_event(rec.policy_id, 'SUCCESS', 'Policy processed successfully');
-
-        EXCEPTION
-            WHEN OTHERS THEN
-
-                v_error_message := SQLERRM;
-
-                -- Log error
-                log_event(rec.policy_id, 'ERROR', v_error_message);
-
-        END;
+        COMMIT;
 
     END LOOP;
 
-    COMMIT;
+    CLOSE c_policy;
 
-    -- Step 3: Aggregate features for AI model
+    -------------------------------------------------------------------
+    -- STEP 3 AGGREGATE FINAL DATASET (AI READY)
+    -------------------------------------------------------------------
     INSERT INTO ai_training_dataset_final(
         customer_id,
         total_policies,
@@ -133,7 +185,7 @@ BEGIN
     )
     SELECT
         customer_id,
-        COUNT(policy_id),
+        COUNT(*),
         AVG(risk_score),
         SUM(claim_count)
     FROM ai_training_dataset_temp
@@ -141,19 +193,22 @@ BEGIN
 
     COMMIT;
 
-    -- Step 4: DBA-style maintenance (automation)
+    -------------------------------------------------------------------
+    -- STEP 4 DBA AUTOMATION (INDEX MAINTENANCE)
+    -------------------------------------------------------------------
     BEGIN
-        EXECUTE IMMEDIATE 'ALTER INDEX IDX_AI_TRAINING REBUILD';
+        EXECUTE IMMEDIATE 'ALTER INDEX IDX_AI_TRAINING REBUILD ONLINE';
     EXCEPTION
         WHEN OTHERS THEN
-            DBMS_OUTPUT.PUT_LINE('Index rebuild skipped.');
+            DBMS_OUTPUT.PUT_LINE('Index rebuild skipped');
     END;
 
-    DBMS_OUTPUT.PUT_LINE('Pipeline Completed Successfully');
+    DBMS_OUTPUT.PUT_LINE('Elite Pipeline Completed');
 
 EXCEPTION
+
     WHEN OTHERS THEN
-        DBMS_OUTPUT.PUT_LINE('Pipeline Failed: ' || SQLERRM);
+        log_event(NULL,'PIPELINE_ERROR',SQLERRM);
         ROLLBACK;
 
 END;
